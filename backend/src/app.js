@@ -8,9 +8,31 @@ import {chatLanguage,baseLanguage,understandChat,localizeChat} from './chat-i18n
 import {matchServices,resolveService,questions,labelsHi,descriptions,normalize} from './service-matcher.js';
 import {localNetworkLinks} from './network.js';
 import {optimizedDashboard,optimizedAnalytics,optimizedAdminSearch,invalidateAdminCache} from './admin-optimized.js';
+import mongoose from 'mongoose';
+import {ensureAdmin} from './seed-admin.js';
 import express from 'express';import cors from 'cors';import helmet from 'helmet';import rateLimit from 'express-rate-limit';import cookieParser from 'cookie-parser';import bcrypt from 'bcryptjs';import jwt from 'jsonwebtoken';import crypto from 'node:crypto';import nodemailer from 'nodemailer';import path from 'node:path';import {fileURLToPath} from 'node:url';
 import {User,Worker,Customer,Availability,Address,Service,Booking,Review,Notification,Support,Transaction,Audit,SkillRequest,WorkerRemark,Payment} from './models.js';import {categories} from './catalog.js';import {canTransition,eligible} from './logic.js';
-export const app=express();app.use(helmet({contentSecurityPolicy:false}));app.use(cors({origin:process.env.APP_URL||'http://localhost:5173',credentials:true}));app.use(express.json({limit:'2mb',verify:(req,res,buf)=>{req.rawBody=buf}}));app.use(cookieParser());app.use('/api',rateLimit({windowMs:60000,limit:250}));
+export const app=express();
+let databaseInit;
+async function ensureDatabase(){
+  if(mongoose.connection.readyState===1)return;
+  if(mongoose.connection.readyState===0)databaseInit=null;
+  if(!databaseInit){
+    databaseInit=(async()=>{
+      if(!process.env.MONGODB_URI)throw new Error('MONGODB_URI is not configured');
+      await mongoose.connect(process.env.MONGODB_URI,{serverSelectionTimeoutMS:10000});
+      await ensureAdmin();
+      await Promise.all(categories.flatMap((category,i)=>category.skills.map((name,j)=>Service.updateOne(
+        {name},
+        {$setOnInsert:{name,category:category.name,description:category.description,icon:category.icon,order:i*10+j,enabled:true}},
+        {upsert:true}
+      ))));
+    })().catch(error=>{databaseInit=null;throw error;});
+  }
+  await databaseInit;
+}
+app.use(helmet({contentSecurityPolicy:false}));app.use(cors({origin:process.env.APP_URL||'http://localhost:5173',credentials:true}));app.use(express.json({limit:'2mb',verify:(req,res,buf)=>{req.rawBody=buf}}));app.use(cookieParser());app.use('/api',rateLimit({windowMs:60000,limit:250}));
+app.use('/api',async(req,res,next)=>{try{await ensureDatabase();next()}catch(error){console.error('Database initialization failed:',error.message);next(error)}});
 const wrap=f=>(req,res,next)=>Promise.resolve(f(req,res,next)).catch(next);const fail=(msg,status=400)=>{throw Object.assign(new Error(msg),{status})};const id=(v)=>{if(!/^[a-f\d]{24}$/i.test(String(v)))fail('Invalid record ID');return v};const txt=(v,max=500)=>typeof v==='string'?v.trim().slice(0,max):'';const notify=async(user,text)=>Notification.create({user,text});const audit=async(req,action,targetType,targetId,reason='')=>Audit.create({admin:req.user._id,action,targetType,targetId,reason});
 const publicUser=u=>{const x=u.toObject();delete x.password;delete x.resetHash;delete x.resetExpires;delete x.sessionVersion;return x};
 const auth=wrap(async(req,res,next)=>{try{const p=jwt.verify(req.cookies[req.portal==='admin'?'sajha_admin':req.portal==='agent'?'sajha_agent':'sajha'],process.env.JWT_SECRET);req.user=await User.findById(p.id);if(!req.user||req.user.sessionVersion!==p.v)fail('Please login',401);}catch{fail('Please login',401)}if(req.portal&&(req.portal==='public'?!['customer','worker'].includes(req.user.role):req.user.role!==req.portal))fail('Access denied',403);if(req.user.role==='agent'&&req.user.accountStatus!=='active')fail('Account suspended',403);next()});
@@ -98,4 +120,6 @@ app.patch('/api/admin/reviews/:id',wrap(async(req,res)=>{const r=await Review.fi
 app.patch('/api/admin/skill-requests/:id',wrap(async(req,res)=>{const s=await SkillRequest.findOne({_id:id(req.params.id),status:'pending'});if(!s)fail('Pending request not found',404);if(!['approved','rejected'].includes(req.body.status))fail('Invalid status');s.status=req.body.status;await s.save();if(s.status==='approved')await Worker.updateOne({_id:s.worker},{additionalSkills:s.skills});await audit(req,'Skill request '+s.status,'skill-request',s._id);res.json(s);}));
 app.post('/api/admin/notifications',wrap(async(req,res)=>{const text=txt(req.body.text,1000);if(!text)fail('Message required');let users;if(req.body.user)users=await User.find({_id:id(req.body.user)});else {if(!['customer','worker'].includes(req.body.target))fail('Choose audience');users=await User.find({role:req.body.target});}await Notification.insertMany(users.map(u=>({user:u._id,text,type:['information','warning','success'].includes(req.body.type)?req.body.type:'information'})));await audit(req,'Notification broadcast','users',req.body.target||req.body.user);res.json({sent:users.length});}));
 reportRoutes(app,{wrap,fail});
-const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../frontend/dist');app.use(express.static(root));app.get('*',(req,res,next)=>req.path.startsWith('/api')?res.status(404).json({message:'API not found'}):res.sendFile(path.join(root,'index.html')));app.use((err,req,res,next)=>res.status(err.code===11000?409:err.status||500).json({message:err.code===11000?'This account or record already exists':err.status?err.message:'Server error. Check database connection and server logs.'}));
+app.get('/',(req,res)=>res.json({ok:true,service:'SAJHA API'}));app.get('*',(req,res,next)=>req.path.startsWith('/api')?res.status(404).json({message:'API not found'}):res.status(404).json({message:'Route not found'}));app.use((err,req,res,next)=>res.status(err.code===11000?409:err.status||500).json({message:err.code===11000?'This account or record already exists':err.status?err.message:'Server error. Check database connection and server logs.'}));
+
+export default app;
