@@ -106,7 +106,7 @@ async function ensureDatabase() {
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(
   cors({
-    origin: process.env.APP_URL || "http://localhost:5173",
+    origin: process.env.APP_URL || "https://sajha-drab.vercel.app",
     credentials: true,
   }),
 );
